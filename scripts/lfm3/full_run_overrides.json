@@ -1,0 +1,7 @@
+{
+  "stage1_mcq": {"select_metric": "macro_f1", "val_gen_samples": 1000, "patience": 3},
+  "stage3_cot": {"select_metric": "macro_f1", "val_gen_samples": 2000, "balance_power": 0.5, "patience": 2},
+  "stage4_sleep_cot": {"select_metric": "macro_f1", "sleep_uv": true, "patience": 3},
+  "stage5_ecg_cot": {"select_metric": "macro_f1_weighted", "val_gen_samples": 600, "balance_power": 0.5,
+                     "require_answer_tag": true, "ecg_evals_per_epoch": 4, "patience": 3}
+}

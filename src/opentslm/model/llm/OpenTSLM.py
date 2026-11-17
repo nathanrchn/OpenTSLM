@@ -8,7 +8,6 @@ from enum import Enum
 from huggingface_hub import hf_hub_download
 
 from .OpenTSLMSP import OpenTSLMSP
-from .OpenTSLMFlamingo import OpenTSLMFlamingo
 
 
 class ModelType(Enum):
@@ -50,7 +49,7 @@ class OpenTSLM:
         device: Optional[str] = None,
         cache_dir: Optional[str] = None,
         enable_lora: Optional[bool] = False,
-    ) -> Union[OpenTSLMSP, OpenTSLMFlamingo]:
+    ) -> Union[OpenTSLMSP, "OpenTSLMFlamingo"]:
         """
         Load a pretrained model from Hugging Face Hub.
 
@@ -86,6 +85,8 @@ class OpenTSLM:
                 model.enable_lora()
         elif model_type == ModelType.FLAMINGO:
             # OpenTSLMFlamingo with fixed parameters from curriculum learning
+            from .OpenTSLMFlamingo import OpenTSLMFlamingo
+
             model = OpenTSLMFlamingo(
                 device=device,
                 llm_id=base_llm_id,

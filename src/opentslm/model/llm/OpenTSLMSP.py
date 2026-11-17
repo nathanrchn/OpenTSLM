@@ -32,30 +32,65 @@ class OpenTSLMSP(TimeSeriesLLM):
         self,
         llm_id: str = "meta-llama/Llama-3.2-1B",
         device: str = "cuda",
+        attn_implementation: str = "eager",
+        chat_template: bool = False,
+        max_patches: int = 1024,
+        ts_encoder: str = "cnn",
+        chronos_id: str = "amazon/chronos-2",
+        encoder_trainable: bool = True,
     ):
         super().__init__(device)
 
-        # 1) tokenizer (ensure pad_token exists)
-        self.tokenizer = AutoTokenizer.from_pretrained(llm_id, use_fast=True)
+        # 1) tokenizer (ensure pad_token exists). Segments are sliced assuming right padding.
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            llm_id, use_fast=True, trust_remote_code=True
+        )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.padding_side = "right"
 
         # 2) load LLM
         self.llm = AutoModelForCausalLM.from_pretrained(
             llm_id,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             device_map={"": device},
-            attn_implementation="eager",
+            attn_implementation=attn_implementation,
+            trust_remote_code=True,
         )
-        self.llm.resize_token_embeddings(len(self.tokenizer))
+        if len(self.tokenizer) > self.llm.get_input_embeddings().num_embeddings:
+            self.llm.resize_token_embeddings(len(self.tokenizer))
+
+        # LFM models: one BOS at the start of the sequence and no special tokens inside
+        # text segments or answers (the original Llama/Gemma recipe adds BOS to every segment).
+        model_type = getattr(self.llm.config, "model_type", "") or ""
+        self.is_lfm = model_type.startswith("lfm")
+        self.clean_tokenization = self.is_lfm
+        # Wrap prompts in the ChatML user/assistant turn (non-thinking) for post-trained checkpoints.
+        self.chat_template = chat_template
+        self.last_num_tokens = 0
+        # >1 upweights the label tokens after the final "Answer:" in the training target
+        self.answer_weight = 1.0
 
         # 3) encoder + projector (now internal)
-        self.encoder = TransformerCNNEncoder().to(device)
-        self.projector = MLPProjector(
-            ENCODER_OUTPUT_DIM, self.llm.config.hidden_size, device=device
-        ).to(device)
+        self.ts_encoder = ts_encoder
+        if ts_encoder == "chronos2":
+            # Pretrained Chronos-2 encoder: series of one sample share a group, so leads/axes attend
+            # to each other; one token per 16-point patch plus the [REG] summary token.
+            from chronos import Chronos2Pipeline
 
-        self.patch_size = 4
+            self.encoder = Chronos2Pipeline.from_pretrained(chronos_id, device_map=device).model
+            self.encoder_context = self.encoder.chronos_config.context_length
+            self.patch_size = self.encoder.chronos_config.input_patch_size
+            enc_dim = self.encoder.config.d_model
+        else:
+            self.encoder = TransformerCNNEncoder(max_patches=max_patches).to(device)
+            self.patch_size = 4
+            enc_dim = ENCODER_OUTPUT_DIM
+        self.encoder_trainable = encoder_trainable
+        self.encoder.requires_grad_(encoder_trainable)
+        self.projector = MLPProjector(
+            enc_dim, self.llm.config.hidden_size, device=device
+        ).to(device)
 
         # LoRA-related attributes
         self.lora_enabled = False
@@ -97,6 +132,20 @@ class OpenTSLMSP(TimeSeriesLLM):
         self.original_llm = self.llm
 
         # Default target modules for common architectures
+        if target_modules is None and self.is_lfm:
+            # LFM: attention (q/k/v/o + output gate), short-conv in/out projections, SwiGLU MLP
+            target_modules = [
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "in_proj",
+                "out_proj",
+                "w1",
+                "w2",
+                "w3",
+            ]
         if target_modules is None:
             target_modules = [
                 "q_proj",
@@ -175,6 +224,125 @@ class OpenTSLMSP(TimeSeriesLLM):
         self.lora_enabled = False
         print("✅ LoRA disabled, reverted to frozen LLM")
 
+    def _tokenize(self, texts: List[str]):
+        if self.clean_tokenization:
+            return self.tokenizer(
+                texts, return_tensors="pt", padding=True, add_special_tokens=False
+            )
+        return self.tokenizer(texts, return_tensors="pt", padding=True, truncation=True)
+
+    def _build_prompt_embeds(self, batch: List[Dict[str, any]]) -> List[torch.Tensor]:
+        """Returns one unpadded [L_i, H] prompt embedding per sample (see pad_and_apply_batch)."""
+        device = self.device
+        H = self.llm.config.hidden_size
+        embed = self.llm.get_input_embeddings()
+
+        # 1) Gather all texts
+        all_texts: List[str] = []
+        text_ptrs: List[Tuple[int, int]] = []
+        ts_counts: List[int] = []
+        for sample in batch:
+            pre, post = sample["pre_prompt"], sample["post_prompt"]
+            if self.chat_template:
+                pre = "<|im_start|>user\n" + pre
+                post = post + "<|im_end|>\n<|im_start|>assistant\n<think></think>"
+            start = len(all_texts)
+            all_texts.append(pre)
+            all_texts.extend(sample["time_series_text"])
+            all_texts.append(post)
+            end = len(all_texts)
+            text_ptrs.append((start, end))
+            ts_counts.append(len(sample["time_series_text"]))
+
+        # 2) Tokenize & embed all texts
+        tok = self._tokenize(all_texts)
+        input_ids = tok.input_ids.to(device, non_blocking=True)
+        attn_mask = tok.attention_mask.to(device, non_blocking=True)
+        text_embeds = embed(input_ids)  # [N_all, P_max, H]
+        lengths = attn_mask.sum(dim=1).tolist()
+
+        bos_embed = None
+        if self.clean_tokenization and self.tokenizer.bos_token_id is not None:
+            bos_embed = embed(
+                torch.tensor([self.tokenizer.bos_token_id], device=device)
+            )  # [1, H]
+
+        # 3) Batch time-series encode & project
+        ts_list: List[torch.Tensor] = []
+        for sample in batch:
+            for ts in sample["time_series"]:
+                # ensure [T] → [T,1]
+                if ts.dim() == 1:
+                    ts = ts.unsqueeze(-1)
+                ts_list.append(ts)
+
+        if self.ts_encoder == "chronos2":
+            ts_proj = self._encode_chronos(batch, text_embeds.dtype)
+        else:
+            # Encode series grouped by length so a sample's tokens never depend on the other
+            # samples in the batch (padding to the batch max would add zero patches).
+            ts_proj: List[torch.Tensor] = [None] * len(ts_list)
+            by_len: Dict[int, List[int]] = {}
+            for k, ts in enumerate(ts_list):
+                by_len.setdefault(ts.size(0), []).append(k)
+            for T, ks in by_len.items():
+                x = torch.stack([ts_list[k] for k in ks]).to(device, non_blocking=True)
+                rem = T % self.patch_size
+                if rem:
+                    x = torch.cat(
+                        [x, x.new_zeros(x.size(0), self.patch_size - rem, x.size(2))], dim=1
+                    )
+                enc = self.encoder(x.squeeze(-1))  # [n, N_patches, embed_dim]
+                proj = self.projector(enc).to(text_embeds.dtype)  # [n, N_patches, H]
+                for j, k in enumerate(ks):
+                    ts_proj[k] = proj[j]
+
+        # 4) Re‐assemble per sample
+        all_seq_embeds = []
+        ts_offset = 0
+        for (start, end), n_ts in zip(text_ptrs, ts_counts):
+            seq_embeds = [] if bos_embed is None else [bos_embed]
+
+            # pre_prompt
+            seq_embeds.append(text_embeds[start, : lengths[start], :])
+
+            # each (textᵢ, tsᵢ)
+            for i in range(n_ts):
+                idx = start + 1 + i
+                seq_embeds.append(text_embeds[idx, : lengths[idx], :])
+                seq_embeds.append(ts_proj[ts_offset + i])  # [N_patches, H]
+
+            ts_offset += n_ts
+
+            # post_prompt
+            seq_embeds.append(text_embeds[end - 1, : lengths[end - 1], :])
+
+            all_seq_embeds.append(torch.cat(seq_embeds, dim=0))
+
+        return all_seq_embeds
+
+    def _encode_chronos(self, batch, dtype) -> List[torch.Tensor]:
+        """One projected token sequence per series: its patch embeddings plus the [REG] token."""
+        series, groups = [], []
+        for si, sample in enumerate(batch):
+            for ts in sample["time_series"]:
+                ts = torch.as_tensor(ts, dtype=torch.float32).reshape(-1)[-self.encoder_context :]
+                series.append(ts)
+                groups.append(si)
+        t_max = max(len(x) for x in series)
+        ctx = torch.full((len(series), t_max), float("nan"))
+        for k, x in enumerate(series):  # left-pad with NaN (masked inside Chronos-2)
+            ctx[k, t_max - len(x) :] = x
+        with torch.set_grad_enabled(self.encoder_trainable and torch.is_grad_enabled()):
+            hidden = self.encoder.encode(
+                context=ctx.to(self.device), group_ids=torch.tensor(groups, device=self.device)
+            )[0][0]  # [N, n_patches + REG + future, d]
+        out = []
+        for k, x in enumerate(series):
+            n = -(-len(x) // self.patch_size)
+            out.append(self.projector(hidden[k, -(n + 2) : -1].float()).to(dtype))
+        return out
+
     def pad_and_apply_batch(
         self,
         batch: List[Dict[str, any]],
@@ -217,99 +385,12 @@ class OpenTSLMSP(TimeSeriesLLM):
         - post_prompt: str
         Returns (inputs_embeds, attention_mask)
         """
-        device = self.device
-        H = self.llm.config.hidden_size
-
-        # 1) Gather all texts
-        all_texts: List[str] = []
-        text_ptrs: List[Tuple[int, int]] = []
-        ts_counts: List[int] = []
-        for sample in batch:
-            start = len(all_texts)
-            all_texts.append(sample["pre_prompt"])
-            all_texts.extend(sample["time_series_text"])
-            all_texts.append(sample["post_prompt"])
-            end = len(all_texts)
-            text_ptrs.append((start, end))
-            ts_counts.append(len(sample["time_series_text"]))
-
-        # 2) Tokenize & embed all texts
-        tok = self.tokenizer(
-            all_texts, return_tensors="pt", padding=True, truncation=True
-        )
-        input_ids = tok.input_ids.to(device, non_blocking=True)
-        attn_mask = tok.attention_mask.to(device, non_blocking=True)
-        text_embeds = self.llm.get_input_embeddings()(input_ids)  # [N_all, P_max, H]
-
-        # 3) Batch time-series encode & project
-        ts_list: List[torch.Tensor] = []
-        for sample in batch:
-            for ts in sample["time_series"]:
-                # ensure [T] → [T,1]
-                if ts.dim() == 1:
-                    ts = ts.unsqueeze(-1)
-                ts_list.append(ts)
-
-        if ts_list:
-            ts_padded = pad_sequence(ts_list, batch_first=True).to(
-                device, non_blocking=True
-            )
-            # ── pad time dim to multiple of patch_size ──
-            T_max = ts_padded.size(1)
-            rem = T_max % self.patch_size
-            if rem:
-                pad_len = self.patch_size - rem
-                pad = ts_padded.new_zeros(ts_padded.size(0), pad_len, ts_padded.size(2))
-                ts_padded = torch.cat([ts_padded, pad], dim=1)
-            # ── now ts_padded: [N_ts_total, T_padded, 1]
-
-            # ── key fix: squeeze out the feature dim so encoder sees [B, L] ──
-            ts_enc = self.encoder(
-                ts_padded.squeeze(-1)
-            )  # [N_ts_total, N_patches, embed_dim]
-            ts_proj = self.projector(ts_enc).to(
-                text_embeds.dtype
-            )  # [N_ts_total, N_patches, H]
-        else:
-            ts_proj = torch.empty(0, 0, H, device=device, dtype=text_embeds.dtype)
-
-        # 4) Re‐assemble per sample
-        all_seq_embeds, all_seq_masks = [], []
-        ts_offset = 0
-        for (start, end), n_ts in zip(text_ptrs, ts_counts):
-            sample_embeds = text_embeds[start:end]  # [1+N_ts+1, P_max, H]
-            sample_masks = attn_mask[start:end]  # [1+N_ts+1, P_max]
-            seq_embeds, seq_masks = [], []
-
-            # pre_prompt
-            length = sample_masks[0].sum().item()
-            seq_embeds.append(sample_embeds[0, :length, :])
-            seq_masks.append(sample_masks[0, :length])
-
-            # each (textᵢ, tsᵢ)
-            for i in range(n_ts):
-                idx = 1 + i
-                length = sample_masks[idx].sum().item()
-                seq_embeds.append(sample_embeds[idx, :length, :])
-                seq_masks.append(sample_masks[idx, :length])
-
-                proj = ts_proj[ts_offset + i]  # [N_patches, H]
-                seq_embeds.append(proj)
-                seq_masks.append(
-                    torch.ones(proj.size(0), device=device, dtype=torch.long)
-                )
-
-            ts_offset += n_ts
-
-            # post_prompt (fixed)
-            length = sample_masks[-1].sum().item()
-            seq_embeds.append(sample_embeds[-1, :length, :])
-            seq_masks.append(sample_masks[-1, :length])
-
-            all_seq_embeds.append(torch.cat(seq_embeds, dim=0))
-            all_seq_masks.append(torch.cat(seq_masks, dim=0))
-
-        # 5) Batch-pad the final sequences
+        all_seq_embeds = self._build_prompt_embeds(batch)
+        all_seq_masks = [
+            torch.ones(e.size(0), device=self.device, dtype=torch.long)
+            for e in all_seq_embeds
+        ]
+        # 5) Batch-pad the final sequences (right padding)
         inputs_embeds = pad_sequence(all_seq_embeds, batch_first=True)  # [B, L_max, H]
         attention_mask = pad_sequence(all_seq_masks, batch_first=True)  # [B, L_max]
 
@@ -318,7 +399,17 @@ class OpenTSLMSP(TimeSeriesLLM):
     def generate(
         self, batch: List[Dict[str, any]], max_new_tokens: int = 50, **generate_kwargs
     ) -> List[str]:
-        inputs_embeds, attention_mask = self.pad_and_apply_batch(batch)
+        # Left-pad so every row ends at its prompt and decoding continues from there.
+        seqs = self._build_prompt_embeds(batch)
+        B, L, H = len(seqs), max(e.size(0) for e in seqs), seqs[0].size(1)
+        inputs_embeds = seqs[0].new_zeros(B, L, H)
+        attention_mask = torch.zeros(B, L, device=self.device, dtype=torch.long)
+        for i, e in enumerate(seqs):
+            inputs_embeds[i, L - e.size(0) :] = e
+            attention_mask[i, L - e.size(0) :] = 1
+
+        generate_kwargs.setdefault("pad_token_id", self.tokenizer.pad_token_id)
+        generate_kwargs.setdefault("eos_token_id", self.tokenizer.eos_token_id)
         gen_ids = self.llm.generate(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -330,29 +421,54 @@ class OpenTSLMSP(TimeSeriesLLM):
     def compute_loss(self, batch: List[Dict[str, any]]) -> torch.Tensor:
         """
         batch: same format as generate()
-        answers: List[str] of length B
+        Each sample is laid out contiguously as [prompt, answer] and right-padded, so no padding
+        sits between prompt and answer (matters for convolutional layers, e.g. LFM).
         """
         answers = [b["answer"] for b in batch]
+        prompt_embeds = self._build_prompt_embeds(batch)
 
-        inputs_embeds, attention_mask = self.pad_and_apply_batch(batch)
-        B, L, H = inputs_embeds.size()
-
-        # tokenize answers
-        ans_tok = self.tokenizer(
-            answers, return_tensors="pt", padding=True, truncation=True
-        )
+        ans_tok = self._tokenize(answers)
         ans_ids = ans_tok.input_ids.to(self.device, non_blocking=True)
-        ans_mask = ans_tok.attention_mask.to(self.device, non_blocking=True)
+        ans_len = ans_tok.attention_mask.sum(dim=1).tolist()
         ans_emb = self.llm.get_input_embeddings()(ans_ids)  # [B, A_max, H]
 
-        # append
-        inputs_embeds = torch.cat([inputs_embeds, ans_emb], dim=1)  # [B, L+A, H]
-        attention_mask = torch.cat([attention_mask, ans_mask], dim=1)  # [B, L+A]
+        seqs, labels, weights = [], [], []
+        for i, p in enumerate(prompt_embeds):
+            a = int(ans_len[i])
+            w = torch.ones(p.size(0) + a, device=self.device)
+            if self.answer_weight != 1.0 and "Answer:" in answers[i]:
+                cut = answers[i].rindex("Answer:")
+                n_pre = len(self._tokenize([answers[i][:cut]]).input_ids[0])
+                w[p.size(0) + n_pre :] = self.answer_weight
+            weights.append(w)
+            seqs.append(torch.cat([p, ans_emb[i, :a]], dim=0))
+            labels.append(
+                torch.cat(
+                    [
+                        torch.full((p.size(0),), -100, device=self.device, dtype=torch.long),
+                        ans_ids[i, :a],
+                    ]
+                )
+            )
+        masks = [torch.ones(x.size(0), device=self.device, dtype=torch.long) for x in seqs]
+        inputs_embeds = pad_sequence(seqs, batch_first=True)
+        attention_mask = pad_sequence(masks, batch_first=True)
+        labels = pad_sequence(labels, batch_first=True, padding_value=-100)
+        self.last_num_tokens = int(attention_mask.sum().item())
 
-        # labels: only on the answer tokens
-        total_len = attention_mask.size(1)
-        labels = torch.full((B, total_len), -100, device=self.device, dtype=torch.long)
-        labels[:, L:] = ans_ids
+        if self.is_lfm:
+            # Project only the supervised positions onto the vocabulary: the prompt (mostly
+            # time-series tokens) never needs logits, which saves a lot of memory and compute.
+            base = self.llm.get_base_model() if self.lora_enabled else self.llm
+            hidden = base.model(
+                inputs_embeds=inputs_embeds, attention_mask=attention_mask
+            ).last_hidden_state
+            shift_labels = labels[:, 1:]
+            keep = shift_labels != -100
+            logits = base.lm_head(hidden[:, :-1][keep])
+            ce = torch.nn.functional.cross_entropy(logits.float(), shift_labels[keep], reduction="none")
+            w = pad_sequence(weights, batch_first=True)[:, 1:][keep]
+            return (ce * w).sum() / w.sum()
 
         outputs = self.llm(
             inputs_embeds=inputs_embeds,
