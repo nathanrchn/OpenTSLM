@@ -38,6 +38,7 @@ class OpenTSLMSP(TimeSeriesLLM):
         ts_encoder: str = "cnn",
         chronos_id: str = "amazon/chronos-2",
         encoder_trainable: bool = True,
+        merge_tokens: int = 1,
     ):
         super().__init__(device)
 
@@ -88,8 +89,10 @@ class OpenTSLMSP(TimeSeriesLLM):
             enc_dim = ENCODER_OUTPUT_DIM
         self.encoder_trainable = encoder_trainable
         self.encoder.requires_grad_(encoder_trainable)
+        # Chronos-2 only: concatenate `merge_tokens` consecutive patch embeddings into one LLM token
+        self.merge_tokens = merge_tokens if ts_encoder == "chronos2" else 1
         self.projector = MLPProjector(
-            enc_dim, self.llm.config.hidden_size, device=device
+            enc_dim * self.merge_tokens, self.llm.config.hidden_size, device=device
         ).to(device)
 
         # LoRA-related attributes
@@ -337,10 +340,17 @@ class OpenTSLMSP(TimeSeriesLLM):
             hidden = self.encoder.encode(
                 context=ctx.to(self.device), group_ids=torch.tensor(groups, device=self.device)
             )[0][0]  # [N, n_patches + REG + future, d]
-        out = []
+        out, m = [], self.merge_tokens
         for k, x in enumerate(series):
             n = -(-len(x) // self.patch_size)
-            out.append(self.projector(hidden[k, -(n + 2) : -1].float()).to(dtype))
+            h = hidden[k, -(n + 2) : -1].float()  # n patch tokens + [REG]
+            if m > 1:
+                patches, reg = h[:-1], h[-1:]
+                pad = (-n) % m  # front-pad so the most recent patches are grouped together
+                if pad:
+                    patches = torch.cat([patches.new_zeros(pad, patches.size(1)), patches])
+                h = torch.cat([patches.reshape(-1, m * patches.size(1)), reg.repeat(1, m)])
+            out.append(self.projector(h).to(dtype))
         return out
 
     def pad_and_apply_batch(
@@ -460,7 +470,10 @@ class OpenTSLMSP(TimeSeriesLLM):
             # Project only the supervised positions onto the vocabulary: the prompt (mostly
             # time-series tokens) never needs logits, which saves a lot of memory and compute.
             base = self.llm.get_base_model() if self.lora_enabled else self.llm
-            hidden = base.model(
+            body = getattr(self, "compiled_body", None)  # torch.compile'd body if set
+            if body is None:
+                body = base.model
+            hidden = body(
                 inputs_embeds=inputs_embeds, attention_mask=attention_mask
             ).last_hidden_state
             shift_labels = labels[:, 1:]
