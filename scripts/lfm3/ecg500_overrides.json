@@ -1,0 +1,4 @@
+{
+  "stage5_ecg_cot": {"select_metric": "macro_f1_weighted", "val_gen_samples": 1500, "balance_power": 0.5,
+                     "require_answer_tag": true, "ecg_evals_per_epoch": 4, "patience": 3}
+}

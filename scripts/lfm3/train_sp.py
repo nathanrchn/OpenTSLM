@@ -111,12 +111,37 @@ def dataset_class(stage):
         )
 
         class ECGWithIds(ECGQACoTQADataset):
-            """Keeps template_id / ecg_id on formatted samples (needed by the paper's ECG scorer)."""
+            """Keeps template_id / ecg_id on formatted samples (needed by the paper's ECG scorer).
+            With OPTS["ecg_hz"] == 500 the PTB-XL high-rate signal is used without the 5x downsampling,
+            and each record's 12 leads are stored once (float16) and shared by all its questions."""
+
+            _shared = {}
+
+            @classmethod
+            def _process_ecg_lead(cls, ecg_path, lead_idx):
+                if OPTS.get("ecg_hz", 100) != 500:
+                    return super()._process_ecg_lead(ecg_path, lead_idx)
+                key = f"{ecg_path}:lead_{lead_idx}"
+                if key not in cls._processed_ecg_cache:
+                    sig, _, _ = cls._load_ecg_data(ecg_path)
+                    lead = sig[:, lead_idx] if sig.ndim > 1 else sig
+                    mean, std = float(np.mean(lead)), float(np.std(lead))
+                    norm = (lead - mean) / std if std > 1e-6 else lead - mean
+                    cls._processed_ecg_cache[key] = (norm.astype(np.float32), mean, std)
+                return cls._processed_ecg_cache[key]
 
             def _format_sample(self, row):
                 sample = super()._format_sample(row)
-                # float32 halves host RAM (232k samples x 12 leads x 1000 points)
-                sample["time_series"] = [np.asarray(t, dtype=np.float32) for t in sample["time_series"]]
+                if OPTS.get("ecg_hz", 100) == 500:
+                    key = str(row.get("ecg_paths") or row.get("ecg_id"))
+                    arr = ECGWithIds._shared.get(key)
+                    if arr is None:
+                        arr = np.stack([np.asarray(t, dtype=np.float16) for t in sample["time_series"]])
+                        ECGWithIds._shared[key] = arr
+                    sample["time_series"] = arr
+                else:
+                    # float32 halves host RAM (232k samples x 12 leads x 1000 points)
+                    sample["time_series"] = [np.asarray(t, dtype=np.float32) for t in sample["time_series"]]
                 sample["template_id"] = row.get("template_id")
                 ecg_id = row.get("ecg_id")
                 if isinstance(ecg_id, (list, tuple)):
@@ -152,8 +177,10 @@ def stratified_indices(dataset, fraction, seed, part=0):
 
 
 def collate(batch):
-    # Chronos-2 handles any length itself (OPTS["collate_patch"]=1: no zero padding)
-    return extend_time_series_to_match_patch_size_and_aggregate(batch, patch_size=OPTS.get("collate_patch", PATCH_SIZE))
+    # Chronos-2 handles any length itself (OPTS["collate_patch"]=1: no zero padding).
+    # Shallow copies: collate replaces "time_series" and must not touch the dataset's items.
+    return extend_time_series_to_match_patch_size_and_aggregate([dict(b) for b in batch],
+                                                                patch_size=OPTS.get("collate_patch", PATCH_SIZE))
 
 
 def trainable_state(model):
@@ -230,20 +257,21 @@ def run_test(model, dataset, stage, out_dir, eval_bs, max_new_tokens, limit=None
     preds_path = os.path.join(out_dir, fname)
     done = 0
     t0 = time.time()
+    gen_sub = eval_bs  # shrinks permanently after an OOM
     with open(preds_path, "w", encoding="utf-8") as f:
         for b in range(0, len(idxs), eval_bs):
             batch = collate([dict(dataset[i]) for i in idxs[b : b + eval_bs]])
-            preds, sub = [], len(batch)
+            preds = []
             while len(preds) < len(batch):  # halve the sub-batch on OOM instead of crashing
                 try:
-                    preds += model.generate(batch[len(preds) : len(preds) + sub], max_new_tokens=max_new_tokens,
+                    preds += model.generate(batch[len(preds) : len(preds) + gen_sub], max_new_tokens=max_new_tokens,
                                             do_sample=False)
                 except torch.cuda.OutOfMemoryError:
-                    if sub == 1:
+                    if gen_sub == 1:
                         raise
                     torch.cuda.empty_cache()
-                    sub = max(1, sub // 2)
-                    log(out_dir, event="gen_oom", sub_batch=sub)
+                    gen_sub = max(1, gen_sub // 2)
+                    log(out_dir, event="gen_oom", sub_batch=gen_sub)
             if force:
                 missing = [j for j, pr in enumerate(preds) if "Answer:" not in pr]
                 if missing:
@@ -302,7 +330,11 @@ def run_stage(model, stage, args, root):
     cls = dataset_class(stage)
     eos = model.get_eos_token()
     t_load = time.time()
-    train_ds, val_ds, test_ds = cls("train", EOS_TOKEN=eos), cls("validation", EOS_TOKEN=eos), cls("test", EOS_TOKEN=eos)
+    import contextlib
+
+    quiet = stage == "stage5_ecg_cot" and OPTS.get("ecg_hz", 100) == 500
+    with (contextlib.redirect_stdout(open(os.devnull, "w")) if quiet else contextlib.nullcontext()):
+        train_ds, val_ds, test_ds = cls("train", EOS_TOKEN=eos), cls("validation", EOS_TOKEN=eos), cls("test", EOS_TOKEN=eos)
     log(root, event="data_loaded", stage=stage, train=len(train_ds), val=len(val_ds), test=len(test_ds),
         sec=round(time.time() - t_load, 1))
     if stage == "stage5_ecg_cot":  # formatted samples hold their own copies; drop the raw signal caches
@@ -518,6 +550,7 @@ def main():
     ap.add_argument("--limit_steps", type=int, default=None, help="debug: cap steps per stage, still eval")
     ap.add_argument("--max_patches", type=int, default=4096, help="encoder positional table (M4 has ~10k-point series)")
     ap.add_argument("--ts_encoder", default="cnn", choices=["cnn", "chronos2"])
+    ap.add_argument("--ecg_hz", type=int, default=100, choices=[100, 500], help="ECG sampling rate fed to the encoder")
     ap.add_argument("--train_encoder", action="store_true", help="also train a pretrained (chronos2) encoder")
     ap.add_argument("--answer_weight", type=float, default=1.0, help="loss weight of tokens after the final 'Answer:'")
     ap.add_argument("--force_answer", action="store_true", help="finish generations that lack 'Answer:'")
@@ -541,6 +574,7 @@ def main():
     args.overrides = json.load(open(args.overrides[1:])) if args.overrides.startswith("@") else json.loads(args.overrides)
     OPTS["sleep_uv"] = args.sleep_uv
     OPTS["collate_patch"] = 1 if args.ts_encoder == "chronos2" else PATCH_SIZE
+    OPTS["ecg_hz"] = args.ecg_hz
     FORCE_ANSWER = args.force_answer
     torch.manual_seed(args.seed)
     random.seed(args.seed)
