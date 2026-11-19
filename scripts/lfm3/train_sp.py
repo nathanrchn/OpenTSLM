@@ -18,6 +18,7 @@ import json
 import math
 import re
 import os
+import pickle
 import random
 import sys
 import time
@@ -140,6 +141,7 @@ def dataset_class(stage):
 
         return SleepUV
     if stage == "stage5_ecg_cot":
+        from opentslm.prompt.text_time_series_prompt import TextTimeSeriesPrompt
         from opentslm.time_series_datasets.ecg_qa.ECGQACoTQADataset import (
             ECGQACoTQADataset,
         )
@@ -150,6 +152,20 @@ def dataset_class(stage):
             and each record's 12 leads are stored once (float16) and shared by all its questions."""
 
             _shared = {}
+            _prompt_cache = {}
+
+            def _get_text_time_series_prompt_list(self, row):
+                # 500 Hz: build each record's 12 lead prompts once (float16), not once per question;
+                # the per-question list->array round trips made loading take ~14 min.
+                if OPTS.get("ecg_hz", 100) != 500:
+                    return super()._get_text_time_series_prompt_list(row)
+                key = str(row.get("ecg_paths") or row.get("ecg_id"))
+                hit = ECGWithIds._prompt_cache.get(key)
+                if hit is None:
+                    hit = [TextTimeSeriesPrompt(p.get_text(), p.get_time_series().astype(np.float16))
+                           for p in super()._get_text_time_series_prompt_list(row)]
+                    ECGWithIds._prompt_cache[key] = hit
+                return hit
 
             @classmethod
             def _process_ecg_lead(cls, ecg_path, lead_idx):
@@ -185,6 +201,18 @@ def dataset_class(stage):
 
         return ECGWithIds
     raise ValueError(stage)
+
+
+def ensure_ecg_downloaded():
+    from opentslm.time_series_datasets.ecg_qa.ecgqa_cot_loader import download_ecg_qa_cot_if_not_exists
+    from opentslm.time_series_datasets.ecg_qa.ecgqa_loader import (
+        download_ecg_qa_if_not_exists,
+        download_ptbxl_if_not_exists,
+    )
+
+    download_ecg_qa_if_not_exists()
+    download_ptbxl_if_not_exists()
+    download_ecg_qa_cot_if_not_exists()
 
 
 def final_label(answer: str) -> str:
@@ -394,17 +422,23 @@ def run_stage(model, stage, args, root):
     import contextlib
 
     quiet = stage == "stage5_ecg_cot" and OPTS.get("ecg_hz", 100) == 500
-    if WORLD > 1 and RANK != 0:
+    parallel = stage == "stage5_ecg_cot"  # downloads are separable: rank 0 fetches, then all ranks build
+    if WORLD > 1 and parallel:
+        if RANK == 0:
+            ensure_ecg_downloaded()
+        barrier()
+    elif WORLD > 1 and RANK != 0:
         barrier()  # wait until rank 0 has downloaded/extracted the dataset
     with (contextlib.redirect_stdout(open(os.devnull, "w")) if quiet else contextlib.nullcontext()):
         train_ds, val_ds, test_ds = cls("train", EOS_TOKEN=eos), cls("validation", EOS_TOKEN=eos), cls("test", EOS_TOKEN=eos)
-    if WORLD > 1 and RANK == 0:
+    if WORLD > 1 and RANK == 0 and not parallel:
         barrier()
     log(root, event="data_loaded", stage=stage, train=len(train_ds), val=len(val_ds), test=len(test_ds),
         sec=round(time.time() - t_load, 1))
     if stage == "stage5_ecg_cot":  # formatted samples hold their own copies; drop the raw signal caches
         cls._ecg_data_cache.clear()
         cls._processed_ecg_cache.clear()
+        getattr(cls, "_prompt_cache", {}).clear()
 
     if stage == "stage5_ecg_cot" and args.ecg_train_fraction < 1.0:
         keep = stratified_indices(train_ds, args.ecg_train_fraction, args.seed, args.ecg_subset_part)
@@ -590,11 +624,25 @@ def run_stage(model, stage, args, root):
     load_trainable_state(model, torch.load(best_path, weights_only=False), args.lora_r)
 
     metrics = {"stage": stage, "selection": select_metric or "neg_val_loss", "best_selection": best_sel, "steps": step}
-    if cfg["task"] and not args.skip_test:
+    eval_bs = args.ecg_eval_batch_size if stage == "stage5_ecg_cot" else args.eval_batch_size
+    if cfg["task"] and (not args.skip_test or args.hf_compare or args.dump_test):
         budget, med, mx = answer_token_budget(model, train_ds.dataset if isinstance(train_ds, Subset) else train_ds)
         log(root, event="gen_budget", stage=stage, max_new_tokens=budget, median_answer_tokens=med, max_answer_tokens=mx)
+    if cfg["task"] and args.dump_test and RANK == 0:  # test set for vllm_eval.py, so it need not rebuild it
+        os.makedirs(args.dump_test, exist_ok=True)
         t0 = time.time()
-        eval_bs = args.ecg_eval_batch_size if stage == "stage5_ecg_cot" else args.eval_batch_size
+        with open(os.path.join(args.dump_test, f"{stage}.pkl"), "wb") as f:
+            pickle.dump({"samples": list(test_ds.dataset), "budget": budget}, f, protocol=5)
+        log(root, event="test_dumped", stage=stage, n=len(test_ds), sec=round(time.time() - t0, 1))
+    if cfg["task"] and args.skip_test and args.hf_compare:  # HF generations on a subset, to check vLLM against
+        t0 = time.time()
+        preds = run_test(model, test_ds, stage, stage_dir, eval_bs, budget, args.hf_compare,
+                         fname="test_predictions_hf.jsonl")
+        metrics["hf_compare_seconds"] = round(time.time() - t0)
+        if RANK == 0:
+            metrics["hf_compare"] = {"n": args.hf_compare, **score.score(cfg["task"], preds)}
+    if cfg["task"] and not args.skip_test:
+        t0 = time.time()
         preds = run_test(model, test_ds, stage, stage_dir, eval_bs, budget, args.test_samples)
         metrics["test_seconds"] = round(time.time() - t0)
         if RANK == 0:
@@ -651,6 +699,8 @@ def main():
     ap.add_argument("--compile", action="store_true", help="torch.compile the LLM body for training")
     ap.add_argument("--merge_tokens", type=int, default=1, help="Chronos-2 patch tokens merged per LLM token")
     ap.add_argument("--export_dir", default=None, help="after training: save LoRA-merged LLM + embedder for vLLM")
+    ap.add_argument("--dump_test", default=None, help="dir: pickle each stage's test set + token budget for vllm_eval.py")
+    ap.add_argument("--hf_compare", type=int, default=0, help="with --skip_test: HF-generate N test samples anyway")
     ap.add_argument("--num_workers", type=int, default=0)
     ap.add_argument("--log_every", type=int, default=50)
     ap.add_argument("--seed", type=int, default=42)

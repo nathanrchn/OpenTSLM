@@ -40,32 +40,40 @@ case "${PHASE:-}" in
       2>&1 | tee "$OUT/main.out" | grep --line-buffered -E '^\{|Error|error|Traceback' ; rc=${PIPESTATUS[0]}
     ;;
   pipeline)
-    # Multi-GPU: train (+export) with torchrun, vLLM test generation (one shard per GPU), merge + score.
-    # Env: TRAIN_ARGS (train_sp.py), EVAL_ARGS (vllm_eval.py, incl. --stage), HF_ARGS (HF fallback/compare),
-    #      HF_COMPARE=1 to also run HF generation for an agreement check, SKIP_TRAIN=1 to reuse $OUT/main.
+    # Multi-GPU: train (+export, + test-set dump, + optional HF subset) with torchrun, then vLLM test generation
+    # (one shard per GPU), merge + score. Env: TRAIN_ARGS (train_sp.py; add --hf_compare N for an HF/vLLM
+    # agreement check), EVAL_ARGS (vllm_eval.py, incl. --stage), HF_ARGS (model flags for the HF fallback),
+    # HF_COMPARE=1 forces a separate HF test run, SKIP_TRAIN=1 reuses $OUT/main.
     NGPU=$(nvidia-smi -L | wc -l)
     STAGE=$(echo "${EVAL_ARGS:-}" | grep -oE 'stage[0-9]_[a-z_]+' | head -1); STAGE=${STAGE:-stage5_ecg_cot}
+    # vLLM in its own environment (it pins its own torch/transformers); installed while training runs
+    VENV=$WORK/vllm_env; vrc=0
+    ( pip install -q uv && uv venv -q --python 3.12 "$VENV" && \
+      VIRTUAL_ENV=$VENV uv pip install -q vllm chronos-forecasting pandas wfdb datasets scikit-learn tqdm einops \
+        matplotlib requests huggingface-hub && VIRTUAL_ENV=$VENV uv pip install -q -e "$REPO" --no-deps && \
+      "$VENV/bin/python" -c "import vllm, torch, transformers; print('vllm', vllm.__version__, torch.__version__, transformers.__version__)" \
+    ) > "$WORK/vllm_install.log" 2>&1 &
+    VPID=$!
     if [ "${SKIP_TRAIN:-0}" != 1 ]; then
       torchrun --standalone --nproc_per_node "$NGPU" "$TRAIN" --out_dir "$OUT/main" --export_dir "$OUT/export" \
-        --skip_test ${TRAIN_ARGS:-} 2>&1 | tee "$OUT/main.out" | grep --line-buffered -E '^\{|Error|Traceback'
+        --dump_test "$WORK/test_cache" --skip_test ${TRAIN_ARGS:-} 2>&1 | tee "$OUT/main.out" \
+        | grep --line-buffered -E '^\{|Error|Traceback'
       rc=${PIPESTATUS[0]}
       [ "$rc" -ne 0 ] && { echo "PHASE_DONE rc=$rc (training failed)"; exit $rc; }
     fi
-    # vLLM in its own environment (it pins its own torch/transformers)
-    VENV=$WORK/vllm_env; vrc=0
-    pip install -q uv && uv venv -q --python 3.12 "$VENV" && \
-      VIRTUAL_ENV=$VENV uv pip install -q vllm chronos-forecasting pandas wfdb datasets scikit-learn tqdm einops \
-        matplotlib requests huggingface-hub && VIRTUAL_ENV=$VENV uv pip install -q -e "$REPO" --no-deps || vrc=1
-    "$VENV/bin/python" -c "import vllm, torch, transformers; print('vllm', vllm.__version__, torch.__version__, transformers.__version__)" || vrc=1
+    wait $VPID || vrc=1
+    tail -n 3 "$WORK/vllm_install.log"; cp "$WORK/vllm_install.log" "$OUT/" 2>/dev/null
     mkdir -p "$OUT/vllm"
     if [ "$vrc" -eq 0 ]; then
       for i in $(seq 0 $((NGPU - 1))); do
         CUDA_VISIBLE_DEVICES=$i "$VENV/bin/python" "$REPO/scripts/lfm3/vllm_eval.py" --export_dir "$OUT/export" \
-          --out "$OUT/vllm/test_predictions.jsonl" --shard "$i" --num_shards "$NGPU" ${EVAL_ARGS:-} \
-          > "$OUT/vllm/shard$i.log" 2>&1 &
+          --out "$OUT/vllm/test_predictions.jsonl" --shard "$i" --num_shards "$NGPU" --test_cache "$WORK/test_cache" \
+          ${EVAL_ARGS:-} > "$OUT/vllm/shard$i.log" 2>&1 &
       done
       wait
-      for i in $(seq 0 $((NGPU - 1))); do tail -n 2 "$OUT/vllm/shard$i.log"; grep -q vllm_shard_done "$OUT/vllm/shard$i.log" || vrc=1; done
+      for i in $(seq 0 $((NGPU - 1))); do
+        grep -E '^\{' "$OUT/vllm/shard$i.log" | tail -n 1; grep -q vllm_shard_done "$OUT/vllm/shard$i.log" || vrc=1
+      done
     fi
     if [ "${HF_COMPARE:-0}" = 1 ] || [ "$vrc" -ne 0 ]; then
       echo "running HF generation (compare=${HF_COMPARE:-0}, vllm_rc=$vrc)"
@@ -74,7 +82,10 @@ case "${PHASE:-}" in
       rc=${PIPESTATUS[0]}
     fi
     if [ "$vrc" -eq 0 ]; then
-      CMP=""; [ -f "$OUT/hf/$STAGE/test_predictions.jsonl" ] && CMP="--compare $OUT/hf/$STAGE/test_predictions.jsonl"
+      CMP=""
+      for f in "$OUT/hf/$STAGE/test_predictions.jsonl" "$OUT/main/$STAGE/test_predictions_hf.jsonl"; do
+        [ -f "$f" ] && { CMP="--compare $f"; break; }
+      done
       python "$REPO/scripts/lfm3/vllm_eval.py" --merge --stage "$STAGE" --out "$OUT/vllm/test_predictions.jsonl" \
         --num_shards "$NGPU" $CMP 2>&1 | grep -E '^\{|Error|Traceback'; rc=$((rc | ${PIPESTATUS[0]}))
     fi

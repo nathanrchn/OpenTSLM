@@ -14,6 +14,7 @@ import argparse
 import contextlib
 import json
 import os
+import pickle
 import random
 import sys
 import time
@@ -91,14 +92,22 @@ def record(sample, pred, idx):
 def generate(args):
     from vllm import LLM, SamplingParams
 
-    device = "cuda"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     emb, tok, cfg = build_embedder(args.export_dir, device)
     train_sp.OPTS.update({"collate_patch": 1, "ecg_hz": cfg["ecg_hz"], "sleep_uv": cfg["sleep_uv"]})
-    cls = train_sp.dataset_class(args.stage)
-    quiet = args.stage == "stage5_ecg_cot"
-    with (contextlib.redirect_stdout(open(os.devnull, "w")) if quiet else contextlib.nullcontext()):
-        train_ds, test_ds = cls("train", EOS_TOKEN=tok.eos_token), cls("test", EOS_TOKEN=tok.eos_token)
-    budget = train_sp.answer_token_budget(SimpleNamespace(tokenizer=tok), train_ds)[0]
+    cache = os.path.join(args.test_cache, f"{args.stage}.pkl") if args.test_cache else None
+    if cache and os.path.exists(cache):  # written by train_sp.py --dump_test: no dataset rebuild
+        t0 = time.time()
+        with open(cache, "rb") as f:
+            blob = pickle.load(f)
+        test_ds, budget = blob["samples"], blob["budget"]
+        print(json.dumps({"event": "test_cache_loaded", "n": len(test_ds), "sec": round(time.time() - t0, 1)}), flush=True)
+    else:
+        cls = train_sp.dataset_class(args.stage)
+        quiet = args.stage == "stage5_ecg_cot"
+        with (contextlib.redirect_stdout(open(os.devnull, "w")) if quiet else contextlib.nullcontext()):
+            train_ds, test_ds = cls("train", EOS_TOKEN=tok.eos_token), cls("test", EOS_TOKEN=tok.eos_token)
+        budget = train_sp.answer_token_budget(SimpleNamespace(tokenizer=tok), train_ds)[0]
 
     # same sample selection and ordering as train_sp.run_test
     idxs = list(range(len(test_ds)))
@@ -121,8 +130,11 @@ def generate(args):
     force = args.force_answer and train_sp.STAGE_DEFAULTS[args.stage]["task"] in ("har", "sleep", "ecg")
 
     @torch.no_grad()
-    def embeds_for(samples):
-        return [{"prompt_embeds": e.to("cpu")} for e in emb._build_prompt_embeds(samples)]
+    def embeds_for(samples):  # small encoder batches: vLLM already holds most of the GPU
+        out = []
+        for b in range(0, len(samples), args.embed_bs):
+            out += [{"prompt_embeds": e.to("cpu")} for e in emb._build_prompt_embeds(samples[b : b + args.embed_bs])]
+        return out
 
     out_path = f"{args.out}.shard{args.shard}"
     t0, done = time.time(), 0
@@ -191,6 +203,8 @@ if __name__ == "__main__":
     ap.add_argument("--force_answer", action="store_true")
     ap.add_argument("--chunk", type=int, default=256, help="samples per vLLM generate call")
     ap.add_argument("--gpu_mem", type=float, default=0.75)
+    ap.add_argument("--embed_bs", type=int, default=16, help="samples per time-series encoder call")
+    ap.add_argument("--test_cache", default=None, help="dir with <stage>.pkl from train_sp.py --dump_test")
     ap.add_argument("--max_model_len", type=int, default=8192)
     ap.add_argument("--merge", action="store_true", help="join shards and score")
     ap.add_argument("--compare", default=None, help="HF test_predictions.jsonl to compare against")
