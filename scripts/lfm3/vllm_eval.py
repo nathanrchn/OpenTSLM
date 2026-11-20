@@ -164,6 +164,8 @@ def generate(args):
         out = []
         for b in range(0, len(samples), args.embed_bs):
             out += [{"prompt_embeds": e.to("cpu")} for e in emb._build_prompt_embeds(samples[b : b + args.embed_bs])]
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()  # hand cached blocks back: vLLM's sampler needs them (n>1 OOM'd at 0.8)
         return out
 
     def finish(batch, texts):  # texts[j] = list of generations for batch[j]; complete those lacking "Answer:"
@@ -287,7 +289,7 @@ if __name__ == "__main__":
     ap.add_argument("--greedy", action="store_true", help="with --num_samples: also run greedy decoding")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--chunk", type=int, default=256, help="samples per vLLM generate call")
-    ap.add_argument("--gpu_mem", type=float, default=0.75)
+    ap.add_argument("--gpu_mem", type=float, default=0.65, help="vLLM share of GPU memory; the encoder needs the rest")
     ap.add_argument("--embed_bs", type=int, default=16, help="samples per time-series encoder call")
     ap.add_argument("--test_cache", default=None, help="dir with <stage>.pkl from train_sp.py --dump_test")
     ap.add_argument("--max_model_len", type=int, default=8192)
