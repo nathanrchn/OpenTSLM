@@ -138,6 +138,59 @@ PY
     python "$REPO/scripts/lfm3/vllm_eval.py" --merge --out "$DEST/predictions.jsonl" --num_shards "$NGPU" \
       ${EVAL_ARGS:-} 2>&1 | grep -E '^\{|Error|Traceback'; rc=${PIPESTATUS[0]}
     ;;
+  grpo)
+    # GRPO on an exported SFT model (channel "export", or EXPORT_S3 for another region's bucket), then the vLLM
+    # test evaluation of the selected policy. Env: GRPO_ARGS (grpo_train.py), EVAL_ARGS (vllm_eval.py, test run).
+    NGPU=$(nvidia-smi -L | wc -l)
+    EXPORT=/opt/ml/input/data/export
+    STAGE=$(echo "${GRPO_ARGS:-} ${EVAL_ARGS:-}" | grep -oE 'stage[0-9]_[a-z_]+' | head -1); STAGE=${STAGE:-stage5_ecg_cot}
+    DEST="$OUT/grpo"; mkdir -p "$DEST/vllm"
+    if [ -n "${EXPORT_S3:-}" ]; then
+      python - "$EXPORT_S3" "$WORK/export" <<'PY' || { echo "EXPORT_DOWNLOAD_FAILED"; exit 6; }
+import os, sys, boto3
+uri, dest = sys.argv[1], sys.argv[2]
+bucket, prefix = uri[len("s3://"):].split("/", 1)
+region = boto3.client("s3").get_bucket_location(Bucket=bucket)["LocationConstraint"] or "us-east-1"
+s3 = boto3.client("s3", region_name=region)
+for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
+    for o in page.get("Contents", []):
+        path = os.path.join(dest, o["Key"][len(prefix):].lstrip("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        s3.download_file(bucket, o["Key"], path)
+print("export_downloaded")
+PY
+      EXPORT=$WORK/export
+    fi
+    VENV=$WORK/vllm_env  # one environment for policy training and vLLM rollouts (same process)
+    pip install -q uv && uv venv -q --python 3.12 "$VENV" && \
+      VIRTUAL_ENV=$VENV uv pip install -q vllm "peft==0.21.3" chronos-forecasting pandas wfdb datasets scikit-learn \
+        tqdm einops matplotlib requests huggingface-hub && VIRTUAL_ENV=$VENV uv pip install -q -e "$REPO" --no-deps \
+      > "$DEST/vllm_install.log" 2>&1 || { echo "VLLM_INSTALL_FAILED"; tail -n 20 "$DEST/vllm_install.log"; exit 5; }
+    "$VENV/bin/python" -c "import vllm, torch, transformers, peft; print('env', vllm.__version__, torch.__version__, transformers.__version__, peft.__version__)"
+    GRPO="$REPO/scripts/lfm3/grpo_train.py"
+    COMMON="--export_dir $EXPORT --out_dir $DEST --export_out $DEST/export --dump_test $WORK/test_cache"
+    if [ "$NGPU" -gt 1 ]; then
+      "$VENV/bin/torchrun" --standalone --nproc_per_node "$NGPU" "$GRPO" $COMMON ${GRPO_ARGS:-} 2>&1 \
+        | tee "$DEST/grpo.out" | grep --line-buffered -E '^\{|Error|Traceback'
+    else
+      "$VENV/bin/python" "$GRPO" $COMMON ${GRPO_ARGS:-} 2>&1 | tee "$DEST/grpo.out" | grep --line-buffered -E '^\{|Error|Traceback'
+    fi
+    rc=${PIPESTATUS[0]}
+    [ "$rc" -ne 0 ] && { echo "PHASE_DONE rc=$rc (grpo failed)"; exit $rc; }
+    [ "${SKIP_TEST:-0}" = 1 ] && { echo "PHASE_DONE rc=0 (test skipped)"; exit 0; }
+    for i in $(seq 0 $((NGPU - 1))); do
+      CUDA_VISIBLE_DEVICES=$i "$VENV/bin/python" "$REPO/scripts/lfm3/vllm_eval.py" --export_dir "$DEST/export" \
+        --out "$DEST/vllm/test_predictions.jsonl" --shard "$i" --num_shards "$NGPU" --test_cache "$WORK/test_cache" \
+        ${EVAL_ARGS:-} > "$DEST/vllm/shard$i.log" 2>&1 &
+    done
+    wait
+    for i in $(seq 0 $((NGPU - 1))); do
+      grep -E '^\{' "$DEST/vllm/shard$i.log" | tail -n 1; grep -q vllm_shard_done "$DEST/vllm/shard$i.log" || rc=1
+    done
+    [ "$rc" -ne 0 ] && { tail -n 30 "$DEST/vllm/shard0.log"; echo "PHASE_DONE rc=$rc (test generation failed)"; exit $rc; }
+    python "$REPO/scripts/lfm3/vllm_eval.py" --merge --out "$DEST/vllm/test_predictions.jsonl" --num_shards "$NGPU" \
+      ${EVAL_ARGS:-} 2>&1 | grep -E '^\{|Error|Traceback'; rc=${PIPESTATUS[0]}
+    ;;
   *) echo "unknown PHASE=${PHASE:-}"; rc=2 ;;
 esac
 echo "PHASE_DONE rc=$rc"
