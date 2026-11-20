@@ -97,6 +97,24 @@ case "${PHASE:-}" in
     EXPORT=/opt/ml/input/data/export
     STAGE=$(echo "${EVAL_ARGS:-}" | grep -oE 'stage[0-9]_[a-z_]+' | head -1); STAGE=${STAGE:-stage5_ecg_cot}
     DEST="$OUT/${OUT_NAME:-sample}"; mkdir -p "$DEST"
+    if [ -n "${EXPORT_S3:-}" ]; then  # export in another region's bucket (SageMaker channels must be same-region)
+      python - "$EXPORT_S3" "$WORK/export" <<'PY' || { echo "EXPORT_DOWNLOAD_FAILED"; exit 6; }
+import os, sys, boto3
+uri, dest = sys.argv[1], sys.argv[2]
+bucket, prefix = uri[len("s3://"):].split("/", 1)
+region = boto3.client("s3").get_bucket_location(Bucket=bucket)["LocationConstraint"] or "us-east-1"
+s3 = boto3.client("s3", region_name=region)
+n = 0
+for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
+    for o in page.get("Contents", []):
+        path = os.path.join(dest, o["Key"][len(prefix):].lstrip("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        s3.download_file(bucket, o["Key"], path)
+        n += 1
+print("export_downloaded", n, "files")
+PY
+      EXPORT=$WORK/export
+    fi
     VENV=$WORK/vllm_env
     ( pip install -q uv && uv venv -q --python 3.12 "$VENV" && \
       VIRTUAL_ENV=$VENV uv pip install -q vllm chronos-forecasting pandas wfdb datasets scikit-learn tqdm einops \
