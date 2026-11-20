@@ -117,6 +117,17 @@ def merged_lora_weights(model):
                 yield f"{name}.weight", (w.float() + mod.get_delta_weight("default").float()).to(w.dtype)
 
 
+def embed_prompts(model, batch, bs):
+    """Prompt embeddings in small encoder batches (a 128-sample Chronos-2 batch next to vLLM ran out of memory)."""
+    out = []
+    with torch.no_grad():
+        for b in range(0, len(batch), bs):
+            out += [p.detach() for p in model._build_prompt_embeds(batch[b : b + bs])]
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return out
+
+
 def policy_logprobs(model, prompts, comps):
     """Log-probability of each completion token under the policy. prompts: [L_i, H] embeddings (no grad);
     comps: token id lists. Logits only at completion positions (as in OpenTSLMSP.compute_loss)."""
@@ -215,17 +226,23 @@ class VLLMEngine:
 
     def _model(self):
         eng = self.llm.llm_engine
-        for path in ("model_executor.driver_worker.worker.model_runner.model",
-                     "model_executor.driver_worker.model_runner.model",
-                     "engine_core.engine_core.model_executor.driver_worker.worker.model_runner.model",
-                     "engine_core.engine_core.model_executor.driver_worker.model_runner.model"):
+        for path in ("model_executor.driver_worker.worker.model_runner",
+                     "model_executor.driver_worker.model_runner",
+                     "engine_core.engine_core.model_executor.driver_worker.worker.model_runner",
+                     "engine_core.engine_core.model_executor.driver_worker.model_runner"):
             obj = eng
             try:
                 for part in path.split("."):
                     obj = getattr(obj, part)
-                return obj
             except AttributeError:
                 continue
+            model = obj.get_model() if hasattr(obj, "get_model") else getattr(obj, "model", None)
+            for _ in range(3):  # unwrap CUDA-graph / compile wrappers
+                if model is None or hasattr(model, "load_weights"):
+                    break
+                model = getattr(model, "runnable", None) or getattr(model, "module", None)
+            if model is not None and hasattr(model, "load_weights"):
+                return model
         return None
 
     @torch.no_grad()
@@ -308,9 +325,9 @@ def validate(args, model, engine, val_ds, val_idx, step, budget):
         for b in range(0, len(mine), args.val_chunk):
             chunk = mine[b : b + args.val_chunk]
             batch = train_sp.collate([val_ds[i] for i in chunk])
-            with torch.no_grad():
-                prompts = model._build_prompt_embeds(batch)
+            prompts = embed_prompts(model, batch, args.embed_bs)
             groups = engine.generate(prompts, 1, 0.0, budget, eos)
+            del prompts
             for i, s, g in zip(chunk, batch, groups):
                 f.write(json.dumps(vllm_eval.record(s, g[0].text, i), ensure_ascii=False) + "\n")
     train_sp.barrier()
@@ -406,8 +423,7 @@ def train(args):
         pick = torch.multinomial(weights, p_local * WORLD, replacement=True, generator=g).tolist()
         pick = pick[RANK * p_local : (RANK + 1) * p_local]
         batch = train_sp.collate([train_ds[pool[k]] for k in pick])
-        with torch.no_grad():
-            prompts = [p.detach() for p in model._build_prompt_embeds(batch)]
+        prompts = embed_prompts(model, batch, args.embed_bs)
         engine.wake()
         groups = engine.generate(prompts, args.group_size, args.temperature, budget, eos, want_logprobs=args.tis_cap > 0)
         engine.sleep()
@@ -534,7 +550,8 @@ def parse_args(argv=None):
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--clip", type=float, default=1.0)
     ap.add_argument("--lora_r", type=int, default=16)
-    ap.add_argument("--micro_batch", type=int, default=4, help="sequences per forward/backward")
+    ap.add_argument("--micro_batch", type=int, default=1, help="sequences per forward/backward (~2.6k tokens each)")
+    ap.add_argument("--embed_bs", type=int, default=16, help="samples per time-series encoder call")
     ap.add_argument("--kl_beta", type=float, default=0.0)
     ap.add_argument("--tis_cap", type=float, default=2.0, help="truncated importance weight cap (0: off)")
     ap.add_argument("--reward_weight", default="chance", choices=["chance", "none"])
@@ -546,7 +563,8 @@ def parse_args(argv=None):
     ap.add_argument("--val_chunk", type=int, default=256)
     ap.add_argument("--select_metric", default="macro_f1_weighted")
     ap.add_argument("--patience", type=int, default=4)
-    ap.add_argument("--gpu_mem", type=float, default=0.45, help="vLLM share of the GPU (the policy uses the rest)")
+    ap.add_argument("--gpu_mem", type=float, default=0.35,
+                    help="vLLM share of the GPU; vLLM also caps PyTorch in this process at about the rest")
     ap.add_argument("--vllm_sleep", type=int, default=1, help="free vLLM memory while the policy trains")
     ap.add_argument("--max_model_len", type=int, default=8192)
     ap.add_argument("--max_hours", type=float, default=0.0, help="stop (and still export) after this long")
