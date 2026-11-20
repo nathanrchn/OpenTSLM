@@ -90,6 +90,36 @@ case "${PHASE:-}" in
         --num_shards "$NGPU" $CMP 2>&1 | grep -E '^\{|Error|Traceback'; rc=$((rc | ${PIPESTATUS[0]}))
     fi
     ;;
+  sample)
+    # vLLM only, on an exported model (input channel "export"): e.g. k sampled rationales per question for a
+    # headroom check. Env: EVAL_ARGS (vllm_eval.py: --stage/--split/--num_samples/...), OUT_NAME (default: sample).
+    NGPU=$(nvidia-smi -L | wc -l)
+    EXPORT=/opt/ml/input/data/export
+    STAGE=$(echo "${EVAL_ARGS:-}" | grep -oE 'stage[0-9]_[a-z_]+' | head -1); STAGE=${STAGE:-stage5_ecg_cot}
+    DEST="$OUT/${OUT_NAME:-sample}"; mkdir -p "$DEST"
+    VENV=$WORK/vllm_env
+    ( pip install -q uv && uv venv -q --python 3.12 "$VENV" && \
+      VIRTUAL_ENV=$VENV uv pip install -q vllm chronos-forecasting pandas wfdb datasets scikit-learn tqdm einops \
+        matplotlib requests huggingface-hub && VIRTUAL_ENV=$VENV uv pip install -q -e "$REPO" --no-deps ) \
+      > "$DEST/vllm_install.log" 2>&1 &
+    VPID=$!
+    if [ "$STAGE" = stage5_ecg_cot ]; then  # one download before the per-GPU processes start
+      python -c "import sys; sys.path.insert(0, '$REPO/scripts/lfm3'); import train_sp; train_sp.ensure_ecg_downloaded()" \
+        > "$DEST/download.log" 2>&1 || { echo "DOWNLOAD_FAILED"; tail -n 20 "$DEST/download.log"; exit 4; }
+    fi
+    wait $VPID || { echo "VLLM_INSTALL_FAILED"; tail -n 20 "$DEST/vllm_install.log"; exit 5; }
+    for i in $(seq 0 $((NGPU - 1))); do
+      CUDA_VISIBLE_DEVICES=$i "$VENV/bin/python" "$REPO/scripts/lfm3/vllm_eval.py" --export_dir "$EXPORT" \
+        --out "$DEST/predictions.jsonl" --shard "$i" --num_shards "$NGPU" ${EVAL_ARGS:-} > "$DEST/shard$i.log" 2>&1 &
+    done
+    wait
+    for i in $(seq 0 $((NGPU - 1))); do
+      grep -E '^\{' "$DEST/shard$i.log" | tail -n 1; grep -q vllm_shard_done "$DEST/shard$i.log" || rc=1
+    done
+    [ "$rc" -ne 0 ] && { tail -n 30 "$DEST/shard0.log"; echo "PHASE_DONE rc=$rc (generation failed)"; exit $rc; }
+    python "$REPO/scripts/lfm3/vllm_eval.py" --merge --out "$DEST/predictions.jsonl" --num_shards "$NGPU" \
+      ${EVAL_ARGS:-} 2>&1 | grep -E '^\{|Error|Traceback'; rc=${PIPESTATUS[0]}
+    ;;
   *) echo "unknown PHASE=${PHASE:-}"; rc=2 ;;
 esac
 echo "PHASE_DONE rc=$rc"
